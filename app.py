@@ -217,6 +217,28 @@ def delete_game(game_id):
         s.commit()
 
 
+def update_game(game_id, fields):
+    """fields is a dict of column -> new value for that one game row."""
+    if not fields:
+        return
+    set_clause = ", ".join(f"{k}=:{k}" for k in fields)
+    params = dict(fields)
+    params["id"] = game_id
+    with conn.session as s:
+        s.execute(text(f"UPDATE games SET {set_clause} WHERE id=:id"), params)
+        s.commit()
+
+
+def update_pitcher(pid, name, throws, class_year, pin):
+    with conn.session as s:
+        s.execute(
+            text("""UPDATE pitchers SET name=:name, throws=:throws,
+                class_year=:class_year, pin=:pin WHERE id=:id"""),
+            {"name": name, "throws": throws, "class_year": class_year, "pin": str(pin), "id": pid},
+        )
+        s.commit()
+
+
 # ---------------------------------------------------------------------------
 # Videos
 # ---------------------------------------------------------------------------
@@ -791,6 +813,30 @@ if page == "Add Pitcher":
             st.success(f"Added {name}. Share their PIN with them so they can log in.")
 
     st.divider()
+    st.subheader("Edit pitcher info")
+    st.caption("Fix a typo'd name, class year, or PIN — edit a cell, then click Save Changes.")
+    ps_edit = get_pitchers()
+    if not ps_edit.empty:
+        edit_cols = ["name", "throws", "class_year", "pin"]
+        original_p = ps_edit[["id"] + edit_cols].copy()
+        edited_p = st.data_editor(
+            original_p, disabled=["id"], use_container_width=True, hide_index=True, key="pitcher_editor"
+        )
+        if st.button("Save Changes", key="save_pitcher_edits"):
+            changed = 0
+            for i in range(len(original_p)):
+                orig_row = original_p.iloc[i]
+                new_row = edited_p.iloc[i]
+                if not orig_row[edit_cols].equals(new_row[edit_cols]):
+                    update_pitcher(
+                        int(orig_row.id), new_row["name"], new_row["throws"],
+                        new_row["class_year"], new_row["pin"],
+                    )
+                    changed += 1
+            st.success(f"Saved changes to {changed} pitcher(s).")
+            st.rerun()
+
+    st.divider()
     st.subheader("Remove a pitcher")
     st.caption("This deletes the pitcher and everything tied to them — games, goals, videos. Can't be undone.")
     ps_del = get_pitchers()
@@ -862,7 +908,44 @@ elif page == "Dashboard":
 
 elif page == "Game Log":
     st.header("All Game Data")
-    st.dataframe(get_games(), use_container_width=True, hide_index=True)
+    st.caption("Edit any cell directly, then click Save Changes. Editing 'innings' automatically recalculates the underlying out count.")
+    g = get_games()
+    if g.empty:
+        st.info("No games yet.")
+    else:
+        edit_cols = [
+            "game_date", "opponent", "pitcher", "innings", "pitches", "at_bats", "balls", "strikes",
+            "whiffs", "strikeouts", "walks", "hits", "home_runs", "first_pitch_strikes",
+            "early_ahead", "avg_velo", "max_velo", "earned_runs",
+        ]
+        original = g[["id"] + edit_cols].copy()
+        edited = st.data_editor(
+            original,
+            disabled=["id", "pitcher"],
+            use_container_width=True,
+            hide_index=True,
+            key="game_log_editor",
+        )
+        if st.button("Save Changes"):
+            changed = 0
+            for i in range(len(original)):
+                orig_row = original.iloc[i]
+                new_row = edited.iloc[i]
+                cols_to_check = [c for c in edit_cols if c != "pitcher"]
+                if not orig_row[cols_to_check].equals(new_row[cols_to_check]):
+                    fields = {c: new_row[c] for c in cols_to_check}
+                    try:
+                        innings_val = float(fields["innings"])
+                        full = int(innings_val)
+                        rem = round((innings_val - full) * 10)
+                        fields["outs"] = full * 3 + rem
+                    except (ValueError, TypeError):
+                        st.error(f"Row {i+1}: innings must be like 5.0, 5.1, or 5.2 — skipped.")
+                        continue
+                    update_game(int(orig_row.id), fields)
+                    changed += 1
+            st.success(f"Saved changes to {changed} game(s).")
+            st.rerun()
 
 elif page == "Player Videos":
     render_coach_videos()
