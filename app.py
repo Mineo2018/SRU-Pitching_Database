@@ -211,6 +211,17 @@ def get_games(pid=None):
     )
 
 
+def _native(v):
+    """Converts a pandas/numpy scalar (as returned by st.data_editor) into a
+    plain Python type psycopg2 can bind — numpy.int64/float64 otherwise raise
+    'can't adapt type' errors."""
+    if pd.isna(v):
+        return None
+    if hasattr(v, "item"):
+        return v.item()
+    return v
+
+
 def delete_game(game_id):
     with conn.session as s:
         s.execute(text("DELETE FROM games WHERE id=:id"), {"id": game_id})
@@ -221,9 +232,9 @@ def update_game(game_id, fields):
     """fields is a dict of column -> new value for that one game row."""
     if not fields:
         return
-    set_clause = ", ".join(f"{k}=:{k}" for k in fields)
-    params = dict(fields)
-    params["id"] = game_id
+    params = {k: _native(v) for k, v in fields.items()}
+    set_clause = ", ".join(f"{k}=:{k}" for k in params)
+    params["id"] = int(game_id)
     with conn.session as s:
         s.execute(text(f"UPDATE games SET {set_clause} WHERE id=:id"), params)
         s.commit()
@@ -234,7 +245,11 @@ def update_pitcher(pid, name, throws, class_year, pin):
         s.execute(
             text("""UPDATE pitchers SET name=:name, throws=:throws,
                 class_year=:class_year, pin=:pin WHERE id=:id"""),
-            {"name": name, "throws": throws, "class_year": class_year, "pin": str(pin), "id": pid},
+            {
+                "name": _native(name), "throws": _native(throws),
+                "class_year": _native(class_year), "pin": str(_native(pin)),
+                "id": int(pid),
+            },
         )
         s.commit()
 
