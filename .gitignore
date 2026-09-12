@@ -1,0 +1,4 @@
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+sru_pitching_v2.db
