@@ -838,7 +838,8 @@ def _render_leader_row(df):
     for col, cat in zip(cols, LEADERBOARD_CATS):
         if cat in leaders:
             name, val = leaders[cat]
-            col.metric(cat, name, _fmt_leader_value(cat, val))
+            col.metric(cat, name)
+            col.caption(f"**{_fmt_leader_value(cat, val)}**")
         else:
             col.metric(cat, "—")
 
@@ -849,6 +850,19 @@ def render_leaderboard():
     if all_games.empty:
         st.info("No game data yet.")
         return
+
+    st.subheader("Team Totals")
+    st.caption("Whole pitching staff combined, season to date")
+    team = summarize_games(all_games)
+    cols = st.columns(5)
+    cols[0].metric("First-Pitch Strike %", f'{team["First-Pitch Strike %"]:.1%}')
+    cols[1].metric("Early/Ahead %", f'{team["Early/Ahead %"]:.1%}')
+    cols[2].metric("K %", f'{team["K Rate"]:.1%}')
+    cols[3].metric("BB %", f'{team["BB Rate"]:.1%}')
+    kbb = (team["Strikeouts"] / team["Walks"]) if team["Walks"] else None
+    cols[4].metric("K/BB Ratio", f"{kbb:.2f}" if kbb is not None else "∞")
+
+    st.divider()
     dates = pd.to_datetime(all_games["game_date"], errors="coerce")
     cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=7)
     weekly_games = all_games[dates >= cutoff]
