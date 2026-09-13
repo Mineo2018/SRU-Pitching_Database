@@ -692,6 +692,70 @@ def render_coach_workouts():
                 st.rerun()
 
 
+# ---------------------------------------------------------------------------
+# Leaderboard
+# ---------------------------------------------------------------------------
+LEADERBOARD_CATEGORIES = [
+    ("Whiffs", "whiffs_total", "sum", "{:.0f}"),
+    ("Strikeouts (K)", "k_total", "sum", "{:.0f}"),
+    ("Velo (max)", "max_velo", "max", "{:.1f}"),
+    ("Early/Ahead %", "early_ahead_pct", "pct", "{:.1%}"),
+    ("First-Pitch Strike %", "fps_pct", "pct", "{:.1%}"),
+]
+
+
+def _leaderboard_stats(games_df):
+    if games_df.empty:
+        return pd.DataFrame()
+    g = games_df.groupby("pitcher").agg(
+        whiffs_total=("whiffs", "sum"),
+        k_total=("strikeouts", "sum"),
+        max_velo=("max_velo", "max"),
+        early_ahead_sum=("early_ahead", "sum"),
+        fps_sum=("first_pitch_strikes", "sum"),
+        at_bats_sum=("at_bats", "sum"),
+    ).reset_index()
+    ab = g["at_bats_sum"].replace(0, pd.NA)
+    g["early_ahead_pct"] = g["early_ahead_sum"] / ab
+    g["fps_pct"] = g["fps_sum"] / ab
+    return g
+
+
+def _render_leader_row(games_df):
+    stats = _leaderboard_stats(games_df)
+    if stats.empty:
+        st.info("No games in this period.")
+        return
+    cols = st.columns(len(LEADERBOARD_CATEGORIES))
+    for col, (label, colname, _, fmt) in zip(cols, LEADERBOARD_CATEGORIES):
+        valid = stats.dropna(subset=[colname])
+        if valid.empty:
+            col.metric(label, "—")
+            continue
+        top = valid.loc[valid[colname].idxmax()]
+        col.metric(label, f"{top['pitcher']}")
+        col.caption(fmt.format(top[colname]))
+
+
+def render_leaderboard():
+    st.header("Team Leaderboard")
+    all_games = get_games()
+    if all_games.empty:
+        st.info("No game data yet.")
+        return
+    dates = pd.to_datetime(all_games["game_date"])
+    cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=7)
+    weekly_games = all_games[dates >= cutoff]
+
+    st.subheader("This Week's Leaders")
+    st.caption("Games from the last 7 days.")
+    _render_leader_row(weekly_games)
+
+    st.divider()
+    st.subheader("Season Leaders")
+    _render_leader_row(all_games)
+
+
 st.set_page_config(page_title="SRU Pitching Database", page_icon="⚾", layout="wide")
 init_db()
 
@@ -972,23 +1036,70 @@ elif page == "Workouts":
     render_coach_workouts()
 
 else:
-    st.header("Team Leaderboard")
-    ps = get_pitchers()
-    rows = []
-    for _, p in ps.iterrows():
-        s = aggregate(int(p.id))
-        if s:
-            rows.append(
-                {
-                    "Pitcher": p.name, "Games": s["Games"], "IP": s["IP"], "Strike %": s["Strike %"],
-                    "K": s["Strikeouts"], "BB": s["Walks"], "Whiffs": s["Whiffs"],
-                    "Avg Velo": s["Avg Velo"], "Max Velo": s["Max Velo"],
-                }
-            )
-    if rows:
-        df = pd.DataFrame(rows)
-        for col in ["Strike %"]:
-            df[col] = df[col].map(lambda x: f"{x:.1%}")
-        st.dataframe(df, use_container_width=True, hide_index=True)
-    else:
+    st.header("🏆 Team Leaderboard")
+    all_games = get_games()
+    if all_games.empty:
         st.info("No game data yet.")
+    else:
+        g = all_games.copy()
+        g["game_date_dt"] = pd.to_datetime(g["game_date"], errors="coerce")
+        week_cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=7)
+        weekly = g[g["game_date_dt"] >= week_cutoff]
+
+        def leaders(df):
+            """Returns {category: (pitcher_name, value)} for the given slice of games."""
+            if df.empty:
+                return {}
+            grouped = df.groupby("pitcher").agg(
+                whiffs=("whiffs", "sum"),
+                strikeouts=("strikeouts", "sum"),
+                max_velo=("max_velo", "max"),
+                early_ahead=("early_ahead", "sum"),
+                first_pitch_strikes=("first_pitch_strikes", "sum"),
+                at_bats=("at_bats", "sum"),
+            )
+            out = {}
+            out["Whiffs"] = (grouped["whiffs"].idxmax(), int(grouped["whiffs"].max()))
+            out["K"] = (grouped["strikeouts"].idxmax(), int(grouped["strikeouts"].max()))
+            out["Velo"] = (grouped["max_velo"].idxmax(), float(grouped["max_velo"].max()))
+            rated = grouped[grouped["at_bats"] > 0].copy()
+            if not rated.empty:
+                rated["ea_pct"] = rated["early_ahead"] / rated["at_bats"]
+                rated["fps_pct"] = rated["first_pitch_strikes"] / rated["at_bats"]
+                out["Early/Ahead %"] = (rated["ea_pct"].idxmax(), rated["ea_pct"].max())
+                out["FPS %"] = (rated["fps_pct"].idxmax(), rated["fps_pct"].max())
+            return out
+
+        def fmt(cat, val):
+            if cat == "Velo":
+                return f"{val:.1f} mph"
+            if cat in ("Early/Ahead %", "FPS %"):
+                return f"{val:.1%}"
+            return str(val)
+
+        categories = ["Whiffs", "K", "Velo", "Early/Ahead %", "FPS %"]
+
+        st.subheader("This Week's Leaders")
+        st.caption("Last 7 days")
+        weekly_leaders = leaders(weekly)
+        if not weekly_leaders:
+            st.info("No games logged in the last 7 days.")
+        else:
+            cols = st.columns(len(categories))
+            for col, cat in zip(cols, categories):
+                if cat in weekly_leaders:
+                    name, val = weekly_leaders[cat]
+                    col.metric(cat, name, fmt(cat, val))
+                else:
+                    col.metric(cat, "—")
+
+        st.divider()
+        st.subheader("Season Leaders")
+        season_leaders = leaders(g)
+        cols = st.columns(len(categories))
+        for col, cat in zip(cols, categories):
+            if cat in season_leaders:
+                name, val = season_leaders[cat]
+                col.metric(cat, name, fmt(cat, val))
+            else:
+                col.metric(cat, "—")
