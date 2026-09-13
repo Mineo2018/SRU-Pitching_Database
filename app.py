@@ -415,14 +415,15 @@ def aggregate(pid):
     return summarize_games(get_games(pid))
 
 
-def build_series(pid):
-    """Groups a pitcher's games into 'series' — runs of games on
-    consecutive calendar days (a gap of more than 1 day starts a new
-    series), matching how games get logged in 2-3 day sets. Returns a list
-    of dicts, most recent series first, each with the day-by-day games and
-    one combined summary for the whole series.
+def build_series(pid=None):
+    """Groups games into 'series' — runs of games on consecutive calendar
+    days (a gap of more than 1 day starts a new series), matching how games
+    get logged in 2-3 day sets. Pass a pitcher id for that pitcher's series,
+    or None for the whole team's combined series. Returns a list of dicts,
+    most recent series first, each with the day-by-day games and one
+    combined summary for the whole series.
     """
-    g = get_games(pid)
+    g = get_games(pid) if pid else get_games()
     if g.empty:
         return []
     g = g.copy()
@@ -456,6 +457,81 @@ def build_series(pid):
         })
     series_list.reverse()  # most recent series first
     return series_list
+
+
+def render_series_section(series_list):
+    """Renders the day-by-day + combined breakdown for a list of series.
+    Shared by individual pitcher dashboards and the team-wide Team Stats page."""
+    if not series_list:
+        st.info("No games recorded yet.")
+        return
+    for series in series_list:
+        label = series["start"] if series["start"] == series["end"] else f'{series["start"]} to {series["end"]}'
+        with st.expander(f"Series: {label} ({len(series['daily'])} day(s))", expanded=(series is series_list[0])):
+            daily_rows = []
+            for day in series["daily"]:
+                ds = day["summary"]
+                daily_rows.append({
+                    "Date": day["date"], "IP": ds["IP"], "At Bats": ds["At Bats"],
+                    "Strike %": f'{ds["Strike %"]:.1%}', "FPS %": f'{ds["First-Pitch Strike %"]:.1%}',
+                    "Early/Ahead %": f'{ds["Early/Ahead %"]:.1%}', "BB Rate": f'{ds["BB Rate"]:.1%}',
+                    "K Rate": f'{ds["K Rate"]:.1%}', "Whiffs": ds["Whiffs"], "Max Velo": f'{ds["Max Velo"]:.1f}',
+                })
+            st.dataframe(pd.DataFrame(daily_rows), use_container_width=True, hide_index=True)
+            c = series["combined"]
+            st.markdown("**Combined for this series:**")
+            cols = st.columns(6)
+            combined_metrics = [
+                ("IP", c["IP"]), ("At Bats", c["At Bats"]), ("Strike %", f'{c["Strike %"]:.1%}'),
+                ("FPS %", f'{c["First-Pitch Strike %"]:.1%}'), ("Early/Ahead %", f'{c["Early/Ahead %"]:.1%}'),
+                ("BB Rate", f'{c["BB Rate"]:.1%}'),
+            ]
+            for col, (lab, val) in zip(cols, combined_metrics):
+                col.metric(lab, val)
+            cols2 = st.columns(6)
+            combined_metrics2 = [
+                ("K Rate", f'{c["K Rate"]:.1%}'), ("Whiffs", c["Whiffs"]), ("Strikeouts", c["Strikeouts"]),
+                ("Walks", c["Walks"]), ("Avg Velo", f'{c["Avg Velo"]:.1f}'), ("Max Velo", f'{c["Max Velo"]:.1f}'),
+            ]
+            for col, (lab, val) in zip(cols2, combined_metrics2):
+                col.metric(lab, val)
+
+
+def render_team_stats():
+    """Whole-team combined stats: every pitcher's games merged together,
+    broken down series-by-series and as one season-long cumulative total."""
+    st.header("📊 Team Stats")
+    all_games = get_games()
+    if all_games.empty:
+        st.info("No game data yet.")
+        return
+
+    st.subheader("Season Cumulative (whole team)")
+    team = summarize_games(all_games)
+    st.dataframe(
+        pd.DataFrame({
+            "Metric": [
+                "Games", "IP", "Pitches", "At Bats", "Balls", "Strikes", "Strike %", "Ball %",
+                "First-Pitch Strike %", "Early/Ahead %", "BB Rate", "K Rate", "K/BB Ratio",
+                "Whiffs", "Strikeouts", "Walks", "Hits", "HR", "Avg velo", "Max velo", "Earned runs",
+            ],
+            "Value": [
+                team["Games"], team["IP"], team["Pitches"], team["At Bats"], team["Balls"], team["Strikes"],
+                f'{team["Strike %"]:.1%}', f'{team["Ball %"]:.1%}', f'{team["First-Pitch Strike %"]:.1%}',
+                f'{team["Early/Ahead %"]:.1%}', f'{team["BB Rate"]:.1%}', f'{team["K Rate"]:.1%}',
+                f'{team["Strikeouts"] / team["Walks"]:.2f}' if team["Walks"] else "∞",
+                team["Whiffs"], team["Strikeouts"], team["Walks"], team["Hits"], team["HR"],
+                f'{team["Avg Velo"]:.1f}', f'{team["Max Velo"]:.1f}', team["ER"],
+            ],
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.divider()
+    st.subheader("🗓️ Team Series")
+    st.caption("Every pitcher's games combined, grouped by runs of consecutive days.")
+    render_series_section(build_series())
 
 
 def render_dashboard(pid, name, allow_delete=False):
@@ -527,40 +603,7 @@ def render_dashboard(pid, name, allow_delete=False):
     st.divider()
     st.subheader("🗓️ Game Series")
     st.caption("Games are grouped into runs of consecutive days — each series shows a day-by-day breakdown plus one combined total.")
-    series_list = build_series(pid)
-    if not series_list:
-        st.info("No games recorded yet.")
-    else:
-        for series in series_list:
-            label = series["start"] if series["start"] == series["end"] else f'{series["start"]} to {series["end"]}'
-            with st.expander(f"Series: {label} ({len(series['daily'])} day(s))", expanded=(series is series_list[0])):
-                daily_rows = []
-                for day in series["daily"]:
-                    ds = day["summary"]
-                    daily_rows.append({
-                        "Date": day["date"], "IP": ds["IP"], "At Bats": ds["At Bats"],
-                        "Strike %": f'{ds["Strike %"]:.1%}', "FPS %": f'{ds["First-Pitch Strike %"]:.1%}',
-                        "Early/Ahead %": f'{ds["Early/Ahead %"]:.1%}', "BB Rate": f'{ds["BB Rate"]:.1%}',
-                        "K Rate": f'{ds["K Rate"]:.1%}', "Whiffs": ds["Whiffs"], "Max Velo": f'{ds["Max Velo"]:.1f}',
-                    })
-                st.dataframe(pd.DataFrame(daily_rows), use_container_width=True, hide_index=True)
-                c = series["combined"]
-                st.markdown("**Combined for this series:**")
-                cols = st.columns(6)
-                combined_metrics = [
-                    ("IP", c["IP"]), ("At Bats", c["At Bats"]), ("Strike %", f'{c["Strike %"]:.1%}'),
-                    ("FPS %", f'{c["First-Pitch Strike %"]:.1%}'), ("Early/Ahead %", f'{c["Early/Ahead %"]:.1%}'),
-                    ("BB Rate", f'{c["BB Rate"]:.1%}'),
-                ]
-                for col, (lab, val) in zip(cols, combined_metrics):
-                    col.metric(lab, val)
-                cols2 = st.columns(6)
-                combined_metrics2 = [
-                    ("K Rate", f'{c["K Rate"]:.1%}'), ("Whiffs", c["Whiffs"]), ("Strikeouts", c["Strikeouts"]),
-                    ("Walks", c["Walks"]), ("Avg Velo", f'{c["Avg Velo"]:.1f}'), ("Max Velo", f'{c["Max Velo"]:.1f}'),
-                ]
-                for col, (lab, val) in zip(cols2, combined_metrics2):
-                    col.metric(lab, val)
+    render_series_section(build_series(pid))
 
     st.divider()
     st.subheader("Game-by-Game")
@@ -977,7 +1020,7 @@ with st.sidebar:
 
 if st.session_state.role == "pitcher":
     pid, name = st.session_state.pid, st.session_state.name
-    page = st.sidebar.radio("Navigate", ["My Stats", "My Videos", "My Goals", "My Workouts", "Leaderboard"])
+    page = st.sidebar.radio("Navigate", ["My Stats", "My Videos", "My Goals", "My Workouts", "Team Stats", "Leaderboard"])
     if page == "My Stats":
         render_dashboard(pid, name)
     elif page == "My Videos":
@@ -986,6 +1029,8 @@ if st.session_state.role == "pitcher":
         render_pitcher_goals(pid, name)
     elif page == "My Workouts":
         render_pitcher_workouts(pid, name)
+    elif page == "Team Stats":
+        render_team_stats()
     else:
         render_leaderboard()
     st.stop()
@@ -993,7 +1038,7 @@ if st.session_state.role == "pitcher":
 # --- everything below is coach-only ---
 page = st.sidebar.radio(
     "Navigate",
-    ["Dashboard", "Enter Game", "Add Pitcher", "Game Log", "Team Leaderboard", "Player Videos", "Player Goals", "Workouts"],
+    ["Dashboard", "Enter Game", "Add Pitcher", "Game Log", "Team Stats", "Team Leaderboard", "Player Videos", "Player Goals", "Workouts"],
 )
 
 if page == "Add Pitcher":
@@ -1106,6 +1151,9 @@ elif page == "Dashboard":
         name = st.selectbox("Select pitcher", ps.name.tolist())
         pid = int(ps.loc[ps.name == name, "id"].iloc[0])
         render_dashboard(pid, name, allow_delete=True)
+
+elif page == "Team Stats":
+    render_team_stats()
 
 elif page == "Game Log":
     st.header("All Game Data")
