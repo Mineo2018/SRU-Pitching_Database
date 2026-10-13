@@ -77,6 +77,10 @@ def init_db():
             assigned_to INTEGER REFERENCES pitchers(id),
             due_date TEXT,
             created_at TIMESTAMP DEFAULT now())"""))
+        s.execute(text("""CREATE TABLE IF NOT EXISTS checkins(
+            id SERIAL PRIMARY KEY,
+            pitcher_id INTEGER NOT NULL REFERENCES pitchers(id),
+            checked_in_at TIMESTAMPTZ DEFAULT now())"""))
         s.commit()
 
 
@@ -157,6 +161,39 @@ def check_pitcher_login(name, pin):
     return int(df.iloc[0].id) if not df.empty else None
 
 
+def record_checkin(pid):
+    """Logs one check-in each time a pitcher successfully logs in."""
+    with conn.session as s:
+        s.execute(text("INSERT INTO checkins(pitcher_id) VALUES(:pid)"), {"pid": int(pid)})
+        s.commit()
+
+
+def get_checkin_summary():
+    """One row per pitcher, including pitchers who have never logged in."""
+    return conn.query(
+        """SELECT p.id, p.name,
+               COUNT(c.id) AS total,
+               COUNT(c.id) FILTER (WHERE c.checked_in_at >= now() - interval '7 days') AS last_7_days,
+               COUNT(c.id) FILTER (WHERE c.checked_in_at >= now() - interval '30 days') AS last_30_days,
+               MAX(c.checked_in_at) AS last_check_in
+           FROM pitchers p
+           LEFT JOIN checkins c ON c.pitcher_id = p.id
+           GROUP BY p.id, p.name
+           ORDER BY MAX(c.checked_in_at) DESC NULLS LAST, p.name""",
+        ttl=0,
+    )
+
+
+def get_recent_checkins(limit=500):
+    return conn.query(
+        """SELECT p.name, c.checked_in_at FROM checkins c
+           JOIN pitchers p ON c.pitcher_id = p.id
+           ORDER BY c.checked_in_at DESC LIMIT :limit""",
+        params={"limit": int(limit)},
+        ttl=0,
+    )
+
+
 def delete_pitcher(pid):
     """Removes a pitcher and everything tied to them: games, goals, videos
     (including the actual files in storage), and any workouts assigned
@@ -171,6 +208,7 @@ def delete_pitcher(pid):
         if w.file_path:
             delete_storage_file(w.file_path)
     with conn.session as s:
+        s.execute(text("DELETE FROM checkins WHERE pitcher_id=:pid"), {"pid": pid})
         s.execute(text("DELETE FROM videos WHERE pitcher_id=:pid"), {"pid": pid})
         s.execute(text("DELETE FROM goals WHERE pitcher_id=:pid"), {"pid": pid})
         s.execute(text("DELETE FROM workouts WHERE assigned_to=:pid"), {"pid": pid})
@@ -495,6 +533,63 @@ def render_series_section(series_list):
             ]
             for col, (lab, val) in zip(cols2, combined_metrics2):
                 col.metric(lab, val)
+
+
+def _to_eastern(series):
+    return pd.to_datetime(series, utc=True).dt.tz_convert("America/New_York")
+
+
+def render_activity():
+    """Coach-only: who is actually logging in to the app, and how often."""
+    st.header("📅 Activity")
+    st.caption("Each pitcher login counts as one check-in. Times are Eastern.")
+    summary = get_checkin_summary()
+    if summary.empty:
+        st.info("No pitchers added yet.")
+        return
+
+    total_pitchers = len(summary)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Checked in this week", f"{int((summary['last_7_days'] > 0).sum())} of {total_pitchers}")
+    c2.metric("Check-ins this week", int(summary["last_7_days"].sum()))
+    c3.metric("Never logged in", int((summary["total"] == 0).sum()))
+
+    st.subheader("By pitcher")
+    table = summary.copy()
+    table["last_check_in"] = (
+        _to_eastern(table["last_check_in"]).dt.strftime("%b %d, %Y %I:%M %p").fillna("Never")
+    )
+    table = table.rename(columns={
+        "name": "Pitcher", "last_check_in": "Last check-in",
+        "last_7_days": "Last 7 days", "last_30_days": "Last 30 days", "total": "All time",
+    })
+    st.dataframe(
+        table[["Pitcher", "Last check-in", "Last 7 days", "Last 30 days", "All time"]],
+        use_container_width=True, hide_index=True,
+    )
+
+    recent = get_recent_checkins()
+    if recent.empty:
+        st.info("No check-ins recorded yet — they'll show up here as pitchers log in.")
+        return
+
+    recent = recent.copy()
+    recent["when"] = _to_eastern(recent["checked_in_at"])
+
+    st.subheader("Check-ins per day (last 30 days)")
+    today = pd.Timestamp.now(tz="America/New_York").normalize()
+    days = pd.date_range(today - pd.Timedelta(days=29), today, freq="D")
+    per_day = recent["when"].dt.normalize().dt.tz_localize(None).value_counts()
+    chart = pd.DataFrame({"Check-ins": [int(per_day.get(d, 0)) for d in days.tz_localize(None)]},
+                         index=days.tz_localize(None))
+    st.bar_chart(chart)
+
+    st.subheader("Recent check-ins")
+    log = pd.DataFrame({
+        "Pitcher": recent["name"],
+        "When": recent["when"].dt.strftime("%a %b %d, %Y %I:%M %p"),
+    }).head(50)
+    st.dataframe(log, use_container_width=True, hide_index=True)
 
 
 def render_team_stats():
@@ -986,6 +1081,10 @@ if st.session_state.role is None:
             if go:
                 pid = check_pitcher_login(name, pin)
                 if pid:
+                    try:
+                        record_checkin(pid)
+                    except Exception:
+                        pass  # usage tracking must never block someone from logging in
                     st.session_state.role = "pitcher"
                     st.session_state.pid = pid
                     st.session_state.name = name
@@ -1038,7 +1137,7 @@ if st.session_state.role == "pitcher":
 # --- everything below is coach-only ---
 page = st.sidebar.radio(
     "Navigate",
-    ["Dashboard", "Enter Game", "Add Pitcher", "Game Log", "Team Stats", "Team Leaderboard", "Player Videos", "Player Goals", "Workouts"],
+    ["Dashboard", "Enter Game", "Add Pitcher", "Game Log", "Team Stats", "Team Leaderboard", "Player Videos", "Player Goals", "Workouts", "Activity"],
 )
 
 if page == "Add Pitcher":
@@ -1154,6 +1253,9 @@ elif page == "Dashboard":
 
 elif page == "Team Stats":
     render_team_stats()
+
+elif page == "Activity":
+    render_activity()
 
 elif page == "Game Log":
     st.header("All Game Data")
