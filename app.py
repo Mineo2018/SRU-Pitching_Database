@@ -1,3 +1,4 @@
+import io
 from datetime import date
 import pandas as pd
 import requests
@@ -533,6 +534,183 @@ def render_series_section(series_list):
             ]
             for col, (lab, val) in zip(cols2, combined_metrics2):
                 col.metric(lab, val)
+
+
+# ---------------------------------------------------------------------------
+# Season export (one Excel download: team totals, every pitcher, full game log)
+# ---------------------------------------------------------------------------
+EXPORT_STAT_COLUMNS = [
+    "IP", "H", "K", "BB", "HR", "Strike %", "BB Rate", "K/9", "K/BB",
+    "FPS %", "E+A %", "Avg Velo", "Max Velo",
+]
+_EXPORT_PCT = {"Strike %", "BB Rate", "FPS %", "E+A %"}
+_EXPORT_TWO_DEC = {"K/9", "K/BB"}
+_EXPORT_ONE_DEC = {"IP", "Avg Velo", "Max Velo"}
+
+
+def _ratio(num, den):
+    return float(num) / float(den) if den else None
+
+
+def export_row(x):
+    """Totals and rates for a set of game rows. A rate that can't be calculated
+    (for example K/9 with zero innings) is left blank instead of showing 0."""
+    outs = int(x.outs.sum())
+    pitches = int(x.pitches.sum())
+    at_bats = int(x.at_bats.sum())
+    k = int(x.strikeouts.sum())
+    bb = int(x.walks.sum())
+    return {
+        "IP": float(outs_to_ip(outs)),  # baseball notation: 12.1 = 12 and 1/3
+        "H": int(x.hits.sum()),
+        "K": k,
+        "BB": bb,
+        "HR": int(x.home_runs.sum()),
+        "Strike %": _ratio(x.strikes.sum(), pitches),
+        "BB Rate": _ratio(bb, at_bats),
+        "K/9": _ratio(k * 27, outs),  # k / (outs / 3) * 9, from exact outs
+        "K/BB": (k / bb) if bb else ("\u221e" if k else None),
+        "FPS %": _ratio(x.first_pitch_strikes.sum(), at_bats),
+        "E+A %": _ratio(x.early_ahead.sum(), at_bats),
+        "Avg Velo": float((x.avg_velo * x.pitches).sum() / pitches) if pitches else None,
+        "Max Velo": float(x.max_velo.max()) if len(x) else None,
+    }
+
+
+def export_tables(games, pitchers, start, end):
+    """Returns (team_df, pitchers_df, log_df) for games dated start..end, inclusive.
+    Every pitcher on the roster gets a row, even with no games in the range.
+    Pitcher PINs are never included."""
+    when = pd.to_datetime(games["game_date"], errors="coerce")
+    g = games[(when >= pd.Timestamp(start)) & (when <= pd.Timestamp(end))]
+
+    team_df = pd.DataFrame([{
+        "Game days": int(g["game_date"].nunique()),
+        "Appearances": len(g),
+        **export_row(g),
+    }])
+
+    rows = []
+    for _, p in pitchers.iterrows():
+        sub = g[g["pitcher_id"] == p["id"]]
+        row = {"Pitcher": p["name"], "Throws": p["throws"], "Class": p["class_year"], "Games": len(sub)}
+        if len(sub):
+            row.update(export_row(sub))
+        else:
+            row.update({c: None for c in EXPORT_STAT_COLUMNS})
+        rows.append((int(sub["outs"].sum()), str(p["name"]).lower(), row))
+    rows.sort(key=lambda t: (-t[0], t[1]))  # most innings first
+    pitchers_df = pd.DataFrame(
+        [r for _, _, r in rows], columns=["Pitcher", "Throws", "Class", "Games"] + EXPORT_STAT_COLUMNS
+    )
+
+    log = g.sort_values(["game_date", "pitcher"])
+    log_df = pd.DataFrame({
+        "Date": log["game_date"], "Pitcher": log["pitcher"], "Opponent": log["opponent"],
+        "IP": log["outs"].map(lambda o: float(outs_to_ip(o))),
+        "Pitches": log["pitches"], "At Bats": log["at_bats"], "Balls": log["balls"],
+        "Strikes": log["strikes"], "Whiffs": log["whiffs"], "H": log["hits"], "K": log["strikeouts"],
+        "BB": log["walks"], "HR": log["home_runs"], "ER": log["earned_runs"],
+        "First-Pitch Strikes": log["first_pitch_strikes"], "Early/Ahead": log["early_ahead"],
+        "Avg Velo": log["avg_velo"], "Max Velo": log["max_velo"],
+    })
+    return team_df, pitchers_df, log_df
+
+
+def export_workbook(team_df, pitchers_df, log_df, start, end):
+    """Builds the .xlsx download and returns its bytes."""
+    from openpyxl.styles import Alignment, Font, PatternFill  # imported here so a missing
+    from openpyxl.utils import get_column_letter              # package can't break other pages
+
+    def style(ws, df):
+        ws.freeze_panes = "A2"
+        for i, col in enumerate(df.columns, start=1):
+            head = ws.cell(row=1, column=i)
+            head.font = Font(bold=True, color="FFFFFF")
+            head.fill = PatternFill("solid", fgColor="016F54")
+            head.alignment = Alignment(horizontal="center")
+            fmt = ("0.0%" if col in _EXPORT_PCT else "0.00" if col in _EXPORT_TWO_DEC
+                   else "0.0" if col in _EXPORT_ONE_DEC else None)
+            if fmt:
+                for r in range(2, len(df) + 2):
+                    ws.cell(row=r, column=i).number_format = fmt
+            longest = max([len(str(col))] + [len(str(v)) for v in df[col].head(200)])
+            ws.column_dimensions[get_column_letter(i)].width = min(max(longest + 2, 8), 28)
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        team_df.to_excel(xw, sheet_name="Team Totals", index=False)
+        pitchers_df.to_excel(xw, sheet_name="Pitchers", index=False)
+        log_df.to_excel(xw, sheet_name="Game Log", index=False)
+        for name, df in (("Team Totals", team_df), ("Pitchers", pitchers_df), ("Game Log", log_df)):
+            style(xw.sheets[name], df)
+        notes = [
+            f"Games from {start:%b %d, %Y} to {end:%b %d, %Y}.",
+            "IP is in baseball notation (.1 = one out, .2 = two outs), so don't add the IP column up by hand. "
+            "K/9 and the other rates are calculated from exact outs.",
+            "Strike % = strikes / pitches. BB Rate, FPS % and E+A % are per at-bat faced. "
+            "Avg Velo is weighted by pitches thrown.",
+            "The per-at-bat rates are only as complete as the at-bats entered; "
+            "a game logged with 0 at-bats pushes them up.",
+        ]
+        for n, line in enumerate(notes, start=4):
+            xw.sheets["Team Totals"].cell(row=n, column=1, value=line)
+    return buf.getvalue()
+
+
+def _fmt_export_value(col, v):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    if isinstance(v, str):
+        return v
+    if col in _EXPORT_PCT:
+        return f"{v:.1%}"
+    if col in _EXPORT_TWO_DEC:
+        return f"{v:.2f}"
+    if col in _EXPORT_ONE_DEC:
+        return f"{v:.1f}"
+    return str(v)
+
+
+def _display_export(df):
+    return df.apply(lambda c: c.map(lambda v: _fmt_export_value(c.name, v)))
+
+
+def render_season_export():
+    """Coach-only: pick a date range (defaults to this fall) and download everything."""
+    st.header("📦 Season Export")
+    st.caption("One Excel file with team totals, every pitcher's totals, and the full game log for the dates below.")
+    games, pitchers = get_games(), get_pitchers()
+    if games.empty or pitchers.empty:
+        st.info("No games recorded yet.")
+        return
+
+    today = date.today()
+    year = today.year if today.month >= 8 else today.year - 1  # fall = Aug 1 to Dec 31
+    c1, c2 = st.columns(2)
+    start = c1.date_input("From", date(year, 8, 1), key="export_from")
+    end = c2.date_input("To", date(year, 12, 31), key="export_to")
+    if start > end:
+        st.error("The start date has to come before the end date.")
+        return
+
+    team_df, pitchers_df, log_df = export_tables(games, pitchers, start, end)
+    if log_df.empty:
+        st.info("No games fall in that date range.")
+        return
+
+    st.download_button(
+        "⬇️ Download Excel",
+        data=export_workbook(team_df, pitchers_df, log_df, start, end),
+        file_name=f"SRU_Pitching_{start}_to_{end}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
+    st.subheader(f"Team totals: {start:%b %d} to {end:%b %d, %Y}")
+    st.dataframe(_display_export(team_df), use_container_width=True, hide_index=True)
+    st.subheader("Every pitcher")
+    st.dataframe(_display_export(pitchers_df), use_container_width=True, hide_index=True)
+    st.caption(f"{len(log_df)} appearances are in the Game Log sheet.")
 
 
 def _to_eastern(series):
@@ -1137,7 +1315,7 @@ if st.session_state.role == "pitcher":
 # --- everything below is coach-only ---
 page = st.sidebar.radio(
     "Navigate",
-    ["Dashboard", "Enter Game", "Add Pitcher", "Game Log", "Team Stats", "Team Leaderboard", "Player Videos", "Player Goals", "Workouts", "Activity"],
+    ["Dashboard", "Enter Game", "Add Pitcher", "Game Log", "Team Stats", "Team Leaderboard", "Player Videos", "Player Goals", "Workouts", "Activity", "Season Export"],
 )
 
 if page == "Add Pitcher":
@@ -1256,6 +1434,9 @@ elif page == "Team Stats":
 
 elif page == "Activity":
     render_activity()
+
+elif page == "Season Export":
+    render_season_export()
 
 elif page == "Game Log":
     st.header("All Game Data")
