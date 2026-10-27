@@ -540,10 +540,10 @@ def render_series_section(series_list):
 # Season export (one Excel download: team totals, every pitcher, full game log)
 # ---------------------------------------------------------------------------
 EXPORT_STAT_COLUMNS = [
-    "IP", "H", "K", "BB", "HR", "Strike %", "BB Rate", "K/9", "K/BB",
+    "IP", "H", "K", "BB", "HR", "Strike %", "BB Rate", "K Rate", "K/9", "K/BB",
     "FPS %", "E+A %", "Avg Velo", "Max Velo",
 ]
-_EXPORT_PCT = {"Strike %", "BB Rate", "FPS %", "E+A %"}
+_EXPORT_PCT = {"Strike %", "BB Rate", "K Rate", "FPS %", "E+A %"}
 _EXPORT_TWO_DEC = {"K/9", "K/BB"}
 _EXPORT_ONE_DEC = {"IP", "Avg Velo", "Max Velo"}
 
@@ -568,6 +568,7 @@ def export_row(x):
         "HR": int(x.home_runs.sum()),
         "Strike %": _ratio(x.strikes.sum(), pitches),
         "BB Rate": _ratio(bb, at_bats),
+        "K Rate": _ratio(k, at_bats),
         "K/9": _ratio(k * 27, outs),  # k / (outs / 3) * 9, from exact outs
         "K/BB": (k / bb) if bb else ("\u221e" if k else None),
         "FPS %": _ratio(x.first_pitch_strikes.sum(), at_bats),
@@ -648,7 +649,7 @@ def export_workbook(team_df, pitchers_df, log_df, start, end):
             f"Games from {start:%b %d, %Y} to {end:%b %d, %Y}.",
             "IP is in baseball notation (.1 = one out, .2 = two outs), so don't add the IP column up by hand. "
             "K/9 and the other rates are calculated from exact outs.",
-            "Strike % = strikes / pitches. BB Rate, FPS % and E+A % are per at-bat faced. "
+            "Strike % = strikes / pitches. BB Rate, K Rate, FPS % and E+A % are per at-bat faced. "
             "Avg Velo is weighted by pitches thrown.",
             "The per-at-bat rates are only as complete as the at-bats entered; "
             "a game logged with 0 at-bats pushes them up.",
@@ -836,6 +837,10 @@ def render_dashboard(pid, name, allow_delete=False):
             ("Max Velo", f'{s["Max Velo"]:.1f}'),
         ],
     ):
+        col.metric(lab, val)
+
+    cols = st.columns(6)
+    for col, (lab, val) in zip(cols, [("K Rate", f'{s["K Rate"]:.1%}'), ("BB Rate", f'{s["BB Rate"]:.1%}')]):
         col.metric(lab, val)
 
     st.divider()
