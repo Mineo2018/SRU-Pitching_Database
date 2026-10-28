@@ -411,6 +411,13 @@ def delete_workout(workout_id):
         s.commit()
 
 
+def fmt_baa(v):
+    """Batting average against, baseball style (.245). Blank-safe."""
+    if v is None:
+        return "\u2014"
+    return f"{v:.3f}".lstrip("0")
+
+
 def summarize_games(x):
     """Aggregates a set of already-fetched game rows into the standard stat
     dict. Shared by season totals (aggregate) and series totals, so both use
@@ -425,6 +432,10 @@ def summarize_games(x):
         return None
     pitches = max(x.pitches.sum(), 1)
     at_bats = max(x.at_bats.sum(), 1)
+    # Batting average against = hits / (at-bats - walks). The at-bats entered are batters
+    # faced, so walks come out of the denominator. Hit-by-pitches and sacrifices aren't
+    # tracked, so this can run slightly low.
+    official_ab = int(x.at_bats.sum()) - int(x.walks.sum())
     total_outs = int(x.outs.sum())
     return {
         "Games": len(x),
@@ -439,6 +450,7 @@ def summarize_games(x):
         "Early/Ahead %": x.early_ahead.sum() / at_bats,
         "BB Rate": x.walks.sum() / at_bats,
         "K Rate": x.strikeouts.sum() / at_bats,
+        "BAA": (x.hits.sum() / official_ab) if official_ab > 0 else None,
         "Whiffs": int(x.whiffs.sum()),
         "Strikeouts": int(x.strikeouts.sum()),
         "Walks": int(x.walks.sum()),
@@ -514,7 +526,7 @@ def render_series_section(series_list):
                     "Date": day["date"], "IP": ds["IP"], "At Bats": ds["At Bats"],
                     "Strike %": f'{ds["Strike %"]:.1%}', "FPS %": f'{ds["First-Pitch Strike %"]:.1%}',
                     "Early/Ahead %": f'{ds["Early/Ahead %"]:.1%}', "BB Rate": f'{ds["BB Rate"]:.1%}',
-                    "K Rate": f'{ds["K Rate"]:.1%}', "Whiffs": ds["Whiffs"], "Max Velo": f'{ds["Max Velo"]:.1f}',
+                    "K Rate": f'{ds["K Rate"]:.1%}', "BAA": fmt_baa(ds["BAA"]), "Whiffs": ds["Whiffs"], "Max Velo": f'{ds["Max Velo"]:.1f}',
                 })
             st.dataframe(pd.DataFrame(daily_rows), use_container_width=True, hide_index=True)
             c = series["combined"]
@@ -534,17 +546,19 @@ def render_series_section(series_list):
             ]
             for col, (lab, val) in zip(cols2, combined_metrics2):
                 col.metric(lab, val)
+            st.columns(6)[0].metric("BAA", fmt_baa(c["BAA"]))
 
 
 # ---------------------------------------------------------------------------
 # Season export (one Excel download: team totals, every pitcher, full game log)
 # ---------------------------------------------------------------------------
 EXPORT_STAT_COLUMNS = [
-    "IP", "H", "K", "BB", "HR", "Strike %", "BB Rate", "K Rate", "K/9", "K/BB",
+    "IP", "H", "K", "BB", "HR", "BAA", "Strike %", "BB Rate", "K Rate", "K/9", "K/BB",
     "FPS %", "E+A %", "Avg Velo", "Max Velo",
 ]
 _EXPORT_PCT = {"Strike %", "BB Rate", "K Rate", "FPS %", "E+A %"}
 _EXPORT_TWO_DEC = {"K/9", "K/BB"}
+_EXPORT_THREE_DEC = {"BAA"}
 _EXPORT_ONE_DEC = {"IP", "Avg Velo", "Max Velo"}
 
 
@@ -560,12 +574,15 @@ def export_row(x):
     at_bats = int(x.at_bats.sum())
     k = int(x.strikeouts.sum())
     bb = int(x.walks.sum())
+    hits = int(x.hits.sum())
+    official_ab = at_bats - bb  # walks don't count as at-bats
     return {
         "IP": float(outs_to_ip(outs)),  # baseball notation: 12.1 = 12 and 1/3
-        "H": int(x.hits.sum()),
+        "H": hits,
         "K": k,
         "BB": bb,
         "HR": int(x.home_runs.sum()),
+        "BAA": _ratio(hits, official_ab) if official_ab > 0 else None,
         "Strike %": _ratio(x.strikes.sum(), pitches),
         "BB Rate": _ratio(bb, at_bats),
         "K Rate": _ratio(k, at_bats),
@@ -631,6 +648,7 @@ def export_workbook(team_df, pitchers_df, log_df, start, end):
             head.fill = PatternFill("solid", fgColor="016F54")
             head.alignment = Alignment(horizontal="center")
             fmt = ("0.0%" if col in _EXPORT_PCT else "0.00" if col in _EXPORT_TWO_DEC
+                   else ".000" if col in _EXPORT_THREE_DEC
                    else "0.0" if col in _EXPORT_ONE_DEC else None)
             if fmt:
                 for r in range(2, len(df) + 2):
@@ -650,6 +668,7 @@ def export_workbook(team_df, pitchers_df, log_df, start, end):
             "IP is in baseball notation (.1 = one out, .2 = two outs), so don't add the IP column up by hand. "
             "K/9 and the other rates are calculated from exact outs.",
             "Strike % = strikes / pitches. BB Rate, K Rate, FPS % and E+A % are per at-bat faced. "
+            "BAA = hits / (at-bats - walks); hit-by-pitches and sacrifices aren't tracked, so it can run slightly low. "
             "Avg Velo is weighted by pitches thrown.",
             "The per-at-bat rates are only as complete as the at-bats entered; "
             "a game logged with 0 at-bats pushes them up.",
@@ -664,6 +683,8 @@ def _fmt_export_value(col, v):
         return ""
     if isinstance(v, str):
         return v
+    if col in _EXPORT_THREE_DEC:
+        return fmt_baa(v)
     if col in _EXPORT_PCT:
         return f"{v:.1%}"
     if col in _EXPORT_TWO_DEC:
@@ -787,14 +808,14 @@ def render_team_stats():
             "Metric": [
                 "Games", "IP", "Pitches", "At Bats", "Balls", "Strikes", "Strike %", "Ball %",
                 "First-Pitch Strike %", "Early/Ahead %", "BB Rate", "K Rate", "K/BB Ratio",
-                "Whiffs", "Strikeouts", "Walks", "Hits", "HR", "Avg velo", "Max velo", "Earned runs",
+                "Whiffs", "Strikeouts", "Walks", "Hits", "HR", "BAA", "Avg velo", "Max velo", "Earned runs",
             ],
             "Value": [
                 team["Games"], team["IP"], team["Pitches"], team["At Bats"], team["Balls"], team["Strikes"],
                 f'{team["Strike %"]:.1%}', f'{team["Ball %"]:.1%}', f'{team["First-Pitch Strike %"]:.1%}',
                 f'{team["Early/Ahead %"]:.1%}', f'{team["BB Rate"]:.1%}', f'{team["K Rate"]:.1%}',
                 f'{team["Strikeouts"] / team["Walks"]:.2f}' if team["Walks"] else "∞",
-                team["Whiffs"], team["Strikeouts"], team["Walks"], team["Hits"], team["HR"],
+                team["Whiffs"], team["Strikeouts"], team["Walks"], team["Hits"], team["HR"], fmt_baa(team["BAA"]),
                 f'{team["Avg Velo"]:.1f}', f'{team["Max Velo"]:.1f}', team["ER"],
             ],
         }),
@@ -840,7 +861,7 @@ def render_dashboard(pid, name, allow_delete=False):
         col.metric(lab, val)
 
     cols = st.columns(6)
-    for col, (lab, val) in zip(cols, [("K Rate", f'{s["K Rate"]:.1%}'), ("BB Rate", f'{s["BB Rate"]:.1%}')]):
+    for col, (lab, val) in zip(cols, [("K Rate", f'{s["K Rate"]:.1%}'), ("BB Rate", f'{s["BB Rate"]:.1%}'), ("BAA", fmt_baa(s["BAA"]))]):
         col.metric(lab, val)
 
     st.divider()
@@ -863,14 +884,14 @@ def render_dashboard(pid, name, allow_delete=False):
                 "Metric": [
                     "Games", "IP", "Pitches", "At Bats", "Balls", "Strikes", "Strike %", "Ball %",
                     "First-Pitch Strike %", "Early/Ahead %", "BB Rate", "K Rate", "Whiffs", "Strikeouts", "Walks",
-                    "Hits", "HR", "Avg velo", "Max velo", "Earned runs",
+                    "Hits", "HR", "BAA", "Avg velo", "Max velo", "Earned runs",
                 ],
                 "Value": [
                     s["Games"], s["IP"], s["Pitches"], s["At Bats"], s["Balls"], s["Strikes"], f'{s["Strike %"]:.1%}',
                     f'{s["Ball %"]:.1%}', f'{s["First-Pitch Strike %"]:.1%}', f'{s["Early/Ahead %"]:.1%}',
                     f'{s["BB Rate"]:.1%}', f'{s["K Rate"]:.1%}',
                     s["Whiffs"], s["Strikeouts"], s["Walks"], s["Hits"],
-                    s["HR"], f'{s["Avg Velo"]:.1f}', f'{s["Max Velo"]:.1f}', s["ER"],
+                    s["HR"], fmt_baa(s["BAA"]), f'{s["Avg Velo"]:.1f}', f'{s["Max Velo"]:.1f}', s["ER"],
                 ],
             }
         ),
@@ -1175,13 +1196,14 @@ def render_leaderboard():
     st.subheader("Team Totals")
     st.caption("Whole pitching staff combined, season to date")
     team = summarize_games(all_games)
-    cols = st.columns(5)
+    cols = st.columns(6)
     cols[0].metric("First-Pitch Strike %", f'{team["First-Pitch Strike %"]:.1%}')
     cols[1].metric("Early/Ahead %", f'{team["Early/Ahead %"]:.1%}')
     cols[2].metric("K %", f'{team["K Rate"]:.1%}')
     cols[3].metric("BB %", f'{team["BB Rate"]:.1%}')
     kbb = (team["Strikeouts"] / team["Walks"]) if team["Walks"] else None
     cols[4].metric("K/BB Ratio", f"{kbb:.2f}" if kbb is not None else "∞")
+    cols[5].metric("BAA", fmt_baa(team["BAA"]))
 
     st.divider()
     dates = pd.to_datetime(all_games["game_date"], errors="coerce")
