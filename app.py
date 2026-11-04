@@ -78,6 +78,14 @@ def init_db():
             assigned_to INTEGER REFERENCES pitchers(id),
             due_date TEXT,
             created_at TIMESTAMP DEFAULT now())"""))
+        s.execute(text("""CREATE TABLE IF NOT EXISTS velo_training(
+            id SERIAL PRIMARY KEY,
+            pitcher_id INTEGER NOT NULL REFERENCES pitchers(id),
+            test_date TEXT NOT NULL,
+            mound_velo REAL,
+            pulldown_velo REAL,
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT now())"""))
         s.execute(text("""CREATE TABLE IF NOT EXISTS checkins(
             id SERIAL PRIMARY KEY,
             pitcher_id INTEGER NOT NULL REFERENCES pitchers(id),
@@ -210,6 +218,7 @@ def delete_pitcher(pid):
             delete_storage_file(w.file_path)
     with conn.session as s:
         s.execute(text("DELETE FROM checkins WHERE pitcher_id=:pid"), {"pid": pid})
+        s.execute(text("DELETE FROM velo_training WHERE pitcher_id=:pid"), {"pid": pid})
         s.execute(text("DELETE FROM videos WHERE pitcher_id=:pid"), {"pid": pid})
         s.execute(text("DELETE FROM goals WHERE pitcher_id=:pid"), {"pid": pid})
         s.execute(text("DELETE FROM workouts WHERE assigned_to=:pid"), {"pid": pid})
@@ -409,6 +418,63 @@ def delete_workout(workout_id):
     with conn.session as s:
         s.execute(text("DELETE FROM workouts WHERE id=:id"), {"id": workout_id})
         s.commit()
+
+
+def add_velo_entry(pid, test_date, mound_velo, pulldown_velo, notes):
+    with conn.session as s:
+        s.execute(
+            text("""INSERT INTO velo_training(pitcher_id,test_date,mound_velo,pulldown_velo,notes)
+                VALUES(:pid,:test_date,:mound,:pulldown,:notes)"""),
+            {"pid": int(pid), "test_date": test_date, "mound": mound_velo,
+             "pulldown": pulldown_velo, "notes": notes},
+        )
+        s.commit()
+
+
+def get_velo_entries(pid=None):
+    """Velo Training entries, newest first. One pitcher if pid is given,
+    otherwise everyone (with the pitcher's name attached)."""
+    if pid:
+        return conn.query(
+            """SELECT v.*, p.name AS pitcher FROM velo_training v
+               JOIN pitchers p ON v.pitcher_id = p.id
+               WHERE v.pitcher_id=:pid ORDER BY v.test_date DESC, v.id DESC""",
+            params={"pid": int(pid)}, ttl=0,
+        )
+    return conn.query(
+        """SELECT v.*, p.name AS pitcher FROM velo_training v
+           JOIN pitchers p ON v.pitcher_id = p.id
+           ORDER BY v.test_date DESC, v.id DESC""",
+        ttl=0,
+    )
+
+
+def update_velo_entry(entry_id, test_date, mound_velo, pulldown_velo, notes):
+    with conn.session as s:
+        s.execute(
+            text("""UPDATE velo_training SET test_date=:test_date, mound_velo=:mound,
+                pulldown_velo=:pulldown, notes=:notes WHERE id=:id"""),
+            {"id": int(entry_id), "test_date": str(test_date), "mound": mound_velo,
+             "pulldown": pulldown_velo, "notes": notes},
+        )
+        s.commit()
+
+
+def delete_velo_entry(entry_id):
+    with conn.session as s:
+        s.execute(text("DELETE FROM velo_training WHERE id=:id"), {"id": int(entry_id)})
+        s.commit()
+
+
+def _clean_velo(v):
+    """NaN/None/0 -> None (not measured that day), otherwise a plain float."""
+    if v is None or pd.isna(v) or float(v) <= 0:
+        return None
+    return round(float(v), 1)
+
+
+def fmt_velo(v):
+    return "—" if v is None or pd.isna(v) else f"{float(v):.1f}"
 
 
 def fmt_baa(v):
@@ -1125,6 +1191,151 @@ def render_coach_workouts():
 
 
 # ---------------------------------------------------------------------------
+# Velo Training — max mound velo + pulldown velo over time, plus a top-5
+# leaderboard for each. Coach enters data; pitchers see their own progress and
+# the team top 5s.
+# ---------------------------------------------------------------------------
+def _velo_top5(df, col, label):
+    """Top 5 pitchers by their single best value in `col`, with the date set."""
+    st.subheader(f"Top 5 — {label}")
+    d = df[df[col].notna() & (df[col] > 0)]
+    if d.empty:
+        st.caption("No entries yet.")
+        return
+    best = d.sort_values([col, "test_date"], ascending=[False, True]).drop_duplicates("pitcher")
+    best = best.head(5).reset_index(drop=True)
+    out = pd.DataFrame({
+        "Rank": range(1, len(best) + 1),
+        "Pitcher": best["pitcher"],
+        "Velo": best[col].map(lambda v: f"{v:.1f}"),
+        "Date": best["test_date"],
+    })
+    st.dataframe(out, hide_index=True, use_container_width=True)
+
+
+def _render_velo_leaderboards():
+    allv = get_velo_entries()
+    if allv.empty:
+        st.info("No velocity entries yet.")
+        return
+    c1, c2 = st.columns(2)
+    with c1:
+        _velo_top5(allv, "pulldown_velo", "Pulldown Velo")
+    with c2:
+        _velo_top5(allv, "mound_velo", "Mound Velo")
+
+
+def _render_velo_progress(pid, name):
+    v = get_velo_entries(pid)
+    if v.empty:
+        st.info(f"No velocity entries for {name} yet.")
+        return
+    v = v.sort_values(["test_date", "id"])
+
+    # Quick summary: best, latest, and change since the first entry
+    cols = st.columns(2)
+    for col_box, (col, label) in zip(cols, [("pulldown_velo", "Pulldown"), ("mound_velo", "Mound")]):
+        series = v[col].dropna()
+        series = series[series > 0]
+        with col_box:
+            if series.empty:
+                st.metric(f"{label} (best)", "—")
+            else:
+                delta = series.iloc[-1] - series.iloc[0]
+                st.metric(
+                    f"{label} (best)", f"{series.max():.1f}",
+                    delta=f"{delta:+.1f} since first entry (latest {series.iloc[-1]:.1f})" if len(series) > 1 else None,
+                )
+
+    chart = v.rename(columns={"pulldown_velo": "Pulldown", "mound_velo": "Mound"})
+    chart["test_date"] = pd.to_datetime(chart["test_date"], errors="coerce")
+    chart = chart.dropna(subset=["test_date"])
+    chart = chart.groupby("test_date")[["Pulldown", "Mound"]].max()
+    if len(chart) >= 1:
+        st.line_chart(chart, color=["#2ecc71", "#f1c40f"])
+
+    show = v.sort_values(["test_date", "id"], ascending=False)[["test_date", "pulldown_velo", "mound_velo", "notes"]]
+    show = show.rename(columns={
+        "test_date": "Date", "pulldown_velo": "Pulldown", "mound_velo": "Mound", "notes": "Notes",
+    })
+    st.dataframe(show, hide_index=True, use_container_width=True)
+
+
+def render_pitcher_velo(pid, name):
+    st.header("Velo Training")
+    st.caption("Your max mound velo and pulldown velo over time, plus the team top 5s.")
+    _render_velo_progress(pid, name)
+    st.divider()
+    _render_velo_leaderboards()
+
+
+def render_coach_velo():
+    st.header("Velo Training")
+    ps = get_pitchers()
+    if ps.empty:
+        st.info("Add pitchers first.")
+        return
+
+    st.subheader("Log velocity")
+    st.caption("Enter one or both numbers — leave a field at 0 if it wasn't measured that day.")
+    with st.form("add_velo", clear_on_submit=True):
+        name = st.selectbox("Pitcher", ps.name.tolist())
+        test_date = st.date_input("Date", date.today())
+        a, b = st.columns(2)
+        pulldown = a.number_input("Pulldown velo (mph)", 0.0, 120.0, 0.0, step=0.1)
+        mound = b.number_input("Max mound velo (mph)", 0.0, 110.0, 0.0, step=0.1)
+        notes = st.text_input("Notes (optional)")
+        save = st.form_submit_button("Save Entry")
+    if save:
+        pd_v, m_v = _clean_velo(pulldown), _clean_velo(mound)
+        if pd_v is None and m_v is None:
+            st.error("Enter a pulldown velo, a mound velo, or both.")
+        else:
+            pid = int(ps.loc[ps.name == name, "id"].iloc[0])
+            add_velo_entry(pid, str(test_date), m_v, pd_v, notes.strip() or None)
+            st.success(f"Saved velo entry for {name}.")
+            st.rerun()
+
+    st.divider()
+    _render_velo_leaderboards()
+
+    st.divider()
+    st.subheader("Progress by pitcher")
+    sel = st.selectbox("Pitcher", ps.name.tolist(), key="velo_progress_pitcher")
+    sel_pid = int(ps.loc[ps.name == sel, "id"].iloc[0])
+    _render_velo_progress(sel_pid, sel)
+
+    st.divider()
+    st.subheader("Edit or delete entries")
+    st.caption("Fix a mistake by editing a cell, then click Save Changes. Check the Delete box to remove a row.")
+    entries = get_velo_entries(sel_pid)
+    if entries.empty:
+        return
+    edit_cols = ["test_date", "pulldown_velo", "mound_velo", "notes"]
+    original = entries[["id"] + edit_cols].copy()
+    original["delete"] = False
+    edited = st.data_editor(
+        original, disabled=["id"], hide_index=True, use_container_width=True,
+        key=f"velo_editor_{sel_pid}",
+    )
+    if st.button("Save Changes", key="save_velo_edits"):
+        changed = deleted = 0
+        for i in range(len(original)):
+            o, n = original.iloc[i], edited.iloc[i]
+            if bool(n["delete"]):
+                delete_velo_entry(int(o["id"]))
+                deleted += 1
+            elif not o[edit_cols].equals(n[edit_cols]):
+                update_velo_entry(
+                    int(o["id"]), n["test_date"], _clean_velo(n["mound_velo"]),
+                    _clean_velo(n["pulldown_velo"]), n["notes"] if pd.notna(n["notes"]) else None,
+                )
+                changed += 1
+        st.success(f"Updated {changed} entr{'y' if changed == 1 else 'ies'}, deleted {deleted}.")
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # Leaderboard — shared by both the coach's "Team Leaderboard" page and each
 # pitcher's own "Leaderboard" page, so there's exactly one implementation.
 # ---------------------------------------------------------------------------
@@ -1324,7 +1535,7 @@ with st.sidebar:
 
 if st.session_state.role == "pitcher":
     pid, name = st.session_state.pid, st.session_state.name
-    page = st.sidebar.radio("Navigate", ["My Stats", "My Videos", "My Goals", "My Workouts", "Team Stats", "Leaderboard"])
+    page = st.sidebar.radio("Navigate", ["My Stats", "My Videos", "My Goals", "My Workouts", "Velo Training", "Team Stats", "Leaderboard"])
     if page == "My Stats":
         render_dashboard(pid, name)
     elif page == "My Videos":
@@ -1333,6 +1544,8 @@ if st.session_state.role == "pitcher":
         render_pitcher_goals(pid, name)
     elif page == "My Workouts":
         render_pitcher_workouts(pid, name)
+    elif page == "Velo Training":
+        render_pitcher_velo(pid, name)
     elif page == "Team Stats":
         render_team_stats()
     else:
@@ -1342,7 +1555,7 @@ if st.session_state.role == "pitcher":
 # --- everything below is coach-only ---
 page = st.sidebar.radio(
     "Navigate",
-    ["Dashboard", "Enter Game", "Add Pitcher", "Game Log", "Team Stats", "Team Leaderboard", "Player Videos", "Player Goals", "Workouts", "Activity", "Season Export"],
+    ["Dashboard", "Enter Game", "Add Pitcher", "Game Log", "Team Stats", "Team Leaderboard", "Player Videos", "Player Goals", "Workouts", "Velo Training", "Activity", "Season Export"],
 )
 
 if page == "Add Pitcher":
@@ -1514,6 +1727,9 @@ elif page == "Player Goals":
 
 elif page == "Workouts":
     render_coach_workouts()
+
+elif page == "Velo Training":
+    render_coach_velo()
 
 else:
     render_leaderboard()
