@@ -84,8 +84,13 @@ def init_db():
             test_date TEXT NOT NULL,
             mound_velo REAL,
             pulldown_velo REAL,
+            six_oz_velo REAL,
+            four_oz_velo REAL,
             notes TEXT,
             created_at TIMESTAMP DEFAULT now())"""))
+        # tables created before the weighted-ball columns existed
+        s.execute(text("ALTER TABLE velo_training ADD COLUMN IF NOT EXISTS six_oz_velo REAL"))
+        s.execute(text("ALTER TABLE velo_training ADD COLUMN IF NOT EXISTS four_oz_velo REAL"))
         s.execute(text("""CREATE TABLE IF NOT EXISTS checkins(
             id SERIAL PRIMARY KEY,
             pitcher_id INTEGER NOT NULL REFERENCES pitchers(id),
@@ -420,13 +425,25 @@ def delete_workout(workout_id):
         s.commit()
 
 
-def add_velo_entry(pid, test_date, mound_velo, pulldown_velo, notes):
+# (column, short label, long label) — order is the display order everywhere
+VELO_METRICS = [
+    ("pulldown_velo", "Pulldown", "Pulldown Velo"),
+    ("mound_velo", "Mound", "Mound Velo"),
+    ("six_oz_velo", "6 oz", "6 oz Ball Velo"),
+    ("four_oz_velo", "4 oz", "4 oz Ball Velo"),
+]
+VELO_COLS = [m[0] for m in VELO_METRICS]
+
+
+def add_velo_entry(pid, test_date, vals, notes):
+    """vals: dict of velo column -> float or None."""
     with conn.session as s:
         s.execute(
-            text("""INSERT INTO velo_training(pitcher_id,test_date,mound_velo,pulldown_velo,notes)
-                VALUES(:pid,:test_date,:mound,:pulldown,:notes)"""),
-            {"pid": int(pid), "test_date": test_date, "mound": mound_velo,
-             "pulldown": pulldown_velo, "notes": notes},
+            text("""INSERT INTO velo_training
+                (pitcher_id,test_date,mound_velo,pulldown_velo,six_oz_velo,four_oz_velo,notes)
+                VALUES(:pid,:test_date,:mound_velo,:pulldown_velo,:six_oz_velo,:four_oz_velo,:notes)"""),
+            {"pid": int(pid), "test_date": test_date, "notes": notes,
+             **{c: vals.get(c) for c in VELO_COLS}},
         )
         s.commit()
 
@@ -449,13 +466,14 @@ def get_velo_entries(pid=None):
     )
 
 
-def update_velo_entry(entry_id, test_date, mound_velo, pulldown_velo, notes):
+def update_velo_entry(entry_id, test_date, vals, notes):
     with conn.session as s:
         s.execute(
-            text("""UPDATE velo_training SET test_date=:test_date, mound_velo=:mound,
-                pulldown_velo=:pulldown, notes=:notes WHERE id=:id"""),
-            {"id": int(entry_id), "test_date": str(test_date), "mound": mound_velo,
-             "pulldown": pulldown_velo, "notes": notes},
+            text("""UPDATE velo_training SET test_date=:test_date, mound_velo=:mound_velo,
+                pulldown_velo=:pulldown_velo, six_oz_velo=:six_oz_velo,
+                four_oz_velo=:four_oz_velo, notes=:notes WHERE id=:id"""),
+            {"id": int(entry_id), "test_date": str(test_date), "notes": notes,
+             **{c: vals.get(c) for c in VELO_COLS}},
         )
         s.commit()
 
@@ -1198,6 +1216,9 @@ def render_coach_workouts():
 def _velo_top5(df, col, label):
     """Top 5 pitchers by their single best value in `col`, with the date set."""
     st.subheader(f"Top 5 — {label}")
+    if col not in df.columns:
+        st.caption("No entries yet.")
+        return
     d = df[df[col].notna() & (df[col] > 0)]
     if d.empty:
         st.caption("No entries yet.")
@@ -1218,11 +1239,12 @@ def _render_velo_leaderboards():
     if allv.empty:
         st.info("No velocity entries yet.")
         return
-    c1, c2 = st.columns(2)
-    with c1:
-        _velo_top5(allv, "pulldown_velo", "Pulldown Velo")
-    with c2:
-        _velo_top5(allv, "mound_velo", "Mound Velo")
+    # 2 x 2 grid: Pulldown | Mound  /  6 oz | 4 oz
+    for row in (VELO_METRICS[:2], VELO_METRICS[2:]):
+        cols = st.columns(2)
+        for box, (col, _short, long_label) in zip(cols, row):
+            with box:
+                _velo_top5(allv, col, long_label)
 
 
 def _render_velo_progress(pid, name):
@@ -1232,38 +1254,37 @@ def _render_velo_progress(pid, name):
         return
     v = v.sort_values(["test_date", "id"])
 
-    # Quick summary: best, latest, and change since the first entry
-    cols = st.columns(2)
-    for col_box, (col, label) in zip(cols, [("pulldown_velo", "Pulldown"), ("mound_velo", "Mound")]):
+    # Best + change since first entry, one box per measurement
+    boxes = st.columns(len(VELO_METRICS))
+    for box, (col, short, _long) in zip(boxes, VELO_METRICS):
         series = v[col].dropna()
         series = series[series > 0]
-        with col_box:
+        with box:
             if series.empty:
-                st.metric(f"{label} (best)", "—")
+                st.metric(f"{short} (best)", "—")
             else:
-                delta = series.iloc[-1] - series.iloc[0]
                 st.metric(
-                    f"{label} (best)", f"{series.max():.1f}",
-                    delta=f"{delta:+.1f} since first entry (latest {series.iloc[-1]:.1f})" if len(series) > 1 else None,
+                    f"{short} (best)", f"{series.max():.1f}",
+                    delta=f"{series.iloc[-1] - series.iloc[0]:+.1f} since first" if len(series) > 1 else None,
                 )
 
-    chart = v.rename(columns={"pulldown_velo": "Pulldown", "mound_velo": "Mound"})
+    rename = {c: short for c, short, _ in VELO_METRICS}
+    chart = v.rename(columns=rename)
     chart["test_date"] = pd.to_datetime(chart["test_date"], errors="coerce")
     chart = chart.dropna(subset=["test_date"])
-    chart = chart.groupby("test_date")[["Pulldown", "Mound"]].max()
+    shorts = [m[1] for m in VELO_METRICS]
+    chart = chart.groupby("test_date")[shorts].max()
     if len(chart) >= 1:
-        st.line_chart(chart, color=["#2ecc71", "#f1c40f"])
+        st.line_chart(chart, color=["#2ecc71", "#f1c40f", "#3498db", "#e74c3c"])
 
-    show = v.sort_values(["test_date", "id"], ascending=False)[["test_date", "pulldown_velo", "mound_velo", "notes"]]
-    show = show.rename(columns={
-        "test_date": "Date", "pulldown_velo": "Pulldown", "mound_velo": "Mound", "notes": "Notes",
-    })
+    show = v.sort_values(["test_date", "id"], ascending=False)[["test_date"] + VELO_COLS + ["notes"]]
+    show = show.rename(columns={**rename, "test_date": "Date", "notes": "Notes"})
     st.dataframe(show, hide_index=True, use_container_width=True)
 
 
 def render_pitcher_velo(pid, name):
     st.header("Velo Training")
-    st.caption("Your max mound velo and pulldown velo over time, plus the team top 5s.")
+    st.caption("Your pulldown, mound, and weighted-ball velo over time, plus the team top 5s.")
     _render_velo_progress(pid, name)
     st.divider()
     _render_velo_leaderboards()
@@ -1277,22 +1298,26 @@ def render_coach_velo():
         return
 
     st.subheader("Log velocity")
-    st.caption("Enter one or both numbers — leave a field at 0 if it wasn't measured that day.")
+    st.caption("Enter whichever numbers you measured — leave the rest at 0.")
     with st.form("add_velo", clear_on_submit=True):
         name = st.selectbox("Pitcher", ps.name.tolist())
         test_date = st.date_input("Date", date.today())
-        a, b = st.columns(2)
-        pulldown = a.number_input("Pulldown velo (mph)", 0.0, 120.0, 0.0, step=0.1)
-        mound = b.number_input("Max mound velo (mph)", 0.0, 110.0, 0.0, step=0.1)
+        entered = {}
+        r1 = st.columns(2)
+        entered["pulldown_velo"] = r1[0].number_input("Pulldown velo (mph)", 0.0, 120.0, 0.0, step=0.1)
+        entered["mound_velo"] = r1[1].number_input("Max mound velo (mph)", 0.0, 110.0, 0.0, step=0.1)
+        r2 = st.columns(2)
+        entered["six_oz_velo"] = r2[0].number_input("6 oz ball velo (mph)", 0.0, 110.0, 0.0, step=0.1)
+        entered["four_oz_velo"] = r2[1].number_input("4 oz ball velo (mph)", 0.0, 120.0, 0.0, step=0.1)
         notes = st.text_input("Notes (optional)")
         save = st.form_submit_button("Save Entry")
     if save:
-        pd_v, m_v = _clean_velo(pulldown), _clean_velo(mound)
-        if pd_v is None and m_v is None:
-            st.error("Enter a pulldown velo, a mound velo, or both.")
+        vals = {c: _clean_velo(x) for c, x in entered.items()}
+        if all(x is None for x in vals.values()):
+            st.error("Enter at least one velocity.")
         else:
             pid = int(ps.loc[ps.name == name, "id"].iloc[0])
-            add_velo_entry(pid, str(test_date), m_v, pd_v, notes.strip() or None)
+            add_velo_entry(pid, str(test_date), vals, notes.strip() or None)
             st.success(f"Saved velo entry for {name}.")
             st.rerun()
 
@@ -1311,7 +1336,7 @@ def render_coach_velo():
     entries = get_velo_entries(sel_pid)
     if entries.empty:
         return
-    edit_cols = ["test_date", "pulldown_velo", "mound_velo", "notes"]
+    edit_cols = ["test_date"] + VELO_COLS + ["notes"]
     original = entries[["id"] + edit_cols].copy()
     original["delete"] = False
     edited = st.data_editor(
@@ -1327,8 +1352,9 @@ def render_coach_velo():
                 deleted += 1
             elif not o[edit_cols].equals(n[edit_cols]):
                 update_velo_entry(
-                    int(o["id"]), n["test_date"], _clean_velo(n["mound_velo"]),
-                    _clean_velo(n["pulldown_velo"]), n["notes"] if pd.notna(n["notes"]) else None,
+                    int(o["id"]), n["test_date"],
+                    {c: _clean_velo(n[c]) for c in VELO_COLS},
+                    n["notes"] if pd.notna(n["notes"]) else None,
                 )
                 changed += 1
         st.success(f"Updated {changed} entr{'y' if changed == 1 else 'ies'}, deleted {deleted}.")
